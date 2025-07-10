@@ -1,6 +1,6 @@
 {
   "name": "assh",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Advanced SSH Manager - A modern CLI tool for managing SSH servers and tunnels",
   "main": "sm.js",
   "type": "module",
