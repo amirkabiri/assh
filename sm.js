@@ -16,6 +16,40 @@ const execAsync = promisify(exec);
 const CONFIG_DIR = path.join(os.homedir(), ".server-manager");
 const CONFIG_FILE = path.join(CONFIG_DIR, "servers.json");
 
+// Track temp files for cleanup
+const tempFiles = new Set();
+
+// Cleanup function
+function cleanupTempFiles() {
+  tempFiles.forEach((file) => {
+    try {
+      if (fs.existsSync(file)) {
+        fs.removeSync(file);
+      }
+    } catch (error) {
+      // Ignore cleanup errors
+    }
+  });
+  tempFiles.clear();
+}
+
+// Add signal handlers for cleanup
+process.on("SIGINT", () => {
+  console.log(chalk.yellow("\n\nReceived SIGINT, cleaning up..."));
+  cleanupTempFiles();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log(chalk.yellow("\n\nReceived SIGTERM, cleaning up..."));
+  cleanupTempFiles();
+  process.exit(0);
+});
+
+process.on("exit", () => {
+  cleanupTempFiles();
+});
+
 // Default configuration
 const DEFAULT_CONFIG = {
   servers: {},
@@ -218,6 +252,18 @@ program
           message: "Password:",
           when: (answers) => answers.authMethod === "password",
         },
+        {
+          type: "password",
+          name: "singPassword",
+          message: "Sing-box password (optional, for shadowsocks):",
+          default: "",
+        },
+        {
+          type: "input",
+          name: "xrayId",
+          message: "Xray UUID (optional, for VLESS):",
+          default: "",
+        },
       ]);
 
       const serverName = answers.serverName.trim();
@@ -226,6 +272,8 @@ program
         username: answers.username.trim(),
         port: parseInt(answers.port),
         createdAt: new Date().toISOString(),
+        singPassword: answers.singPassword?.trim() || "",
+        xrayId: answers.xrayId?.trim() || "",
       };
 
       if (answers.authMethod === "key") {
@@ -338,6 +386,232 @@ program
     }
   });
 
+// Update server command
+program
+  .command("update")
+  .description("Update server configuration")
+  .action(async () => {
+    try {
+      const serverNames = Object.keys(config.servers);
+
+      if (serverNames.length === 0) {
+        console.log(chalk.yellow("No servers found."));
+        return;
+      }
+
+      const { serverName } = await inquirer.prompt([
+        {
+          type: "list",
+          name: "serverName",
+          message: "Select server to update:",
+          choices: serverNames,
+        },
+      ]);
+
+      const server = config.servers[serverName];
+
+      // Ask which properties to update
+      const { propertiesToUpdate } = await inquirer.prompt([
+        {
+          type: "checkbox",
+          name: "propertiesToUpdate",
+          message: "Select properties to update:",
+          choices: [
+            { name: "IP Address", value: "ip" },
+            { name: "Username", value: "username" },
+            { name: "SSH Port", value: "port" },
+            { name: "Authentication", value: "auth" },
+            { name: "Sing-box Password", value: "singPassword" },
+            { name: "Xray UUID", value: "xrayId" },
+            { name: "Proxy Port", value: "proxyPort" },
+          ],
+        },
+      ]);
+
+      if (propertiesToUpdate.length === 0) {
+        console.log(chalk.yellow("No properties selected for update."));
+        return;
+      }
+
+      const updatePrompts = [];
+
+      if (propertiesToUpdate.includes("ip")) {
+        updatePrompts.push({
+          type: "input",
+          name: "ip",
+          message: "New IP address:",
+          default: server.ip,
+          validate: (input) => (input.trim() ? true : "IP address is required"),
+        });
+      }
+
+      if (propertiesToUpdate.includes("username")) {
+        updatePrompts.push({
+          type: "input",
+          name: "username",
+          message: "New username:",
+          default: server.username,
+        });
+      }
+
+      if (propertiesToUpdate.includes("port")) {
+        updatePrompts.push({
+          type: "input",
+          name: "port",
+          message: "New SSH port:",
+          default: server.port.toString(),
+          validate: (input) => {
+            const port = parseInt(input);
+            return port > 0 && port <= 65535
+              ? true
+              : "Port must be between 1 and 65535";
+          },
+        });
+      }
+
+      if (propertiesToUpdate.includes("auth")) {
+        updatePrompts.push({
+          type: "list",
+          name: "authMethod",
+          message: "New authentication method:",
+          choices: [
+            { name: "Generate SSH Key", value: "key" },
+            { name: "Use existing SSH Key", value: "existing_key" },
+            { name: "Password", value: "password" },
+          ],
+        });
+
+        updatePrompts.push({
+          type: "input",
+          name: "keyPath",
+          message: "SSH key path:",
+          default: "~/.ssh/id_rsa",
+          when: (answers) => answers.authMethod === "existing_key",
+          validate: (input) => {
+            const resolvedPath = input.startsWith("~")
+              ? path.join(os.homedir(), input.slice(1))
+              : path.resolve(input);
+            return fs.existsSync(resolvedPath)
+              ? true
+              : "SSH key file does not exist";
+          },
+        });
+
+        updatePrompts.push({
+          type: "password",
+          name: "password",
+          message: "New password:",
+          when: (answers) => answers.authMethod === "password",
+        });
+      }
+
+      if (propertiesToUpdate.includes("singPassword")) {
+        updatePrompts.push({
+          type: "password",
+          name: "singPassword",
+          message: "New Sing-box password:",
+          default: server.singPassword || "",
+        });
+      }
+
+      if (propertiesToUpdate.includes("xrayId")) {
+        updatePrompts.push({
+          type: "input",
+          name: "xrayId",
+          message: "New Xray UUID:",
+          default: server.xrayId || "",
+        });
+      }
+
+      if (propertiesToUpdate.includes("proxyPort")) {
+        updatePrompts.push({
+          type: "input",
+          name: "proxyPort",
+          message: "New proxy port:",
+          default: server.proxyPort ? server.proxyPort.toString() : "8090",
+          validate: (input) => {
+            const port = parseInt(input);
+            return port > 0 && port <= 65535
+              ? true
+              : "Port must be between 1 and 65535";
+          },
+        });
+      }
+
+      const updates = await inquirer.prompt(updatePrompts);
+
+      // Apply updates
+      if (updates.ip) server.ip = updates.ip.trim();
+      if (updates.username) server.username = updates.username.trim();
+      if (updates.port) server.port = parseInt(updates.port);
+      if (updates.singPassword !== undefined)
+        server.singPassword = updates.singPassword.trim();
+      if (updates.xrayId !== undefined) server.xrayId = updates.xrayId.trim();
+      if (updates.proxyPort) server.proxyPort = parseInt(updates.proxyPort);
+      if (updates.xrayBasePort) {
+        server.xrayPorts = {
+          socks: parseInt(updates.xrayBasePort),
+          http: parseInt(updates.xrayBasePort) + 1,
+        };
+      }
+
+      // Handle authentication updates
+      if (updates.authMethod) {
+        if (updates.authMethod === "key") {
+          console.log(chalk.blue("Generating new SSH key pair..."));
+          const keyInfo = await generateSSHKey(serverName);
+          server.keyPath = keyInfo.privateKeyPath;
+          server.publicKeyPath = keyInfo.publicKeyPath;
+          delete server.password;
+
+          const { installKey } = await inquirer.prompt([
+            {
+              type: "confirm",
+              name: "installKey",
+              message:
+                "Would you like to automatically install the SSH key on the server?",
+              default: true,
+            },
+          ]);
+
+          if (installKey) {
+            const { tempPassword } = await inquirer.prompt([
+              {
+                type: "password",
+                name: "tempPassword",
+                message: "Enter server password for key installation:",
+              },
+            ]);
+
+            await installSSHKey({ ...server, password: tempPassword }, keyInfo);
+          }
+        } else if (updates.authMethod === "existing_key") {
+          const keyPath = updates.keyPath.startsWith("~")
+            ? path.join(os.homedir(), updates.keyPath.slice(1))
+            : path.resolve(updates.keyPath);
+
+          server.keyPath = keyPath;
+          delete server.password;
+          console.log(chalk.green(`Using existing SSH key: ${keyPath}`));
+        } else if (updates.authMethod === "password") {
+          server.password = updates.password;
+          delete server.keyPath;
+          delete server.publicKeyPath;
+        }
+      }
+
+      server.updatedAt = new Date().toISOString();
+      await saveConfig();
+
+      console.log(
+        chalk.green(`✅ Server '${serverName}' updated successfully!`)
+      );
+    } catch (error) {
+      console.error(chalk.red("Error updating server:"), error.message);
+      process.exit(1);
+    }
+  });
+
 // List servers command
 program
   .command("ls")
@@ -353,9 +627,16 @@ program
     }
 
     const table = new Table({
-      head: ["Name", "IP", "Username", "Port", "Auth", "Created"].map((h) =>
-        chalk.cyan(h)
-      ),
+      head: [
+        "Name",
+        "IP",
+        "Username",
+        "Port",
+        "Auth",
+        "Sing-box",
+        "Xray",
+        "Created",
+      ].map((h) => chalk.cyan(h)),
       style: { head: [], border: [] },
     });
 
@@ -367,6 +648,8 @@ program
         chalk.blue(server.username),
         chalk.magenta(server.port),
         server.keyPath ? chalk.green("SSH Key") : chalk.red("Password"),
+        server.singPassword ? chalk.green("✓") : chalk.gray("✗"),
+        server.xrayId ? chalk.green("✓") : chalk.gray("✗"),
         server.createdAt
           ? new Date(server.createdAt).toLocaleDateString()
           : "Unknown",
@@ -407,14 +690,40 @@ program
   .command("socks5")
   .description("Create SOCKS5 proxy tunnel")
   .argument("<serverName>", "Server name")
-  .option(
-    "-p, --port <port>",
-    "Local port for SOCKS5 proxy",
-    config.settings.defaultLocalPort.toString()
-  )
-  .action((serverName, options) => {
+  .option("-p, --port <port>", "Local port for SOCKS5 proxy")
+  .action(async (serverName, options) => {
     const server = getServer(serverName);
-    const localPort = parseInt(options.port);
+    let localPort;
+
+    // Check if port is provided via option
+    if (options.port) {
+      localPort = parseInt(options.port);
+    } else if (server.proxyPort) {
+      // Use stored port preference
+      localPort = server.proxyPort;
+    } else {
+      // Ask for port and store preference
+      const { port } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "port",
+          message: "Enter local port for SOCKS5 proxy:",
+          default: "8090",
+          validate: (input) => {
+            const port = parseInt(input);
+            return port > 0 && port <= 65535
+              ? true
+              : "Port must be between 1 and 65535";
+          },
+        },
+      ]);
+
+      localPort = parseInt(port);
+
+      // Store port preference
+      server.proxyPort = localPort;
+      await saveConfig();
+    }
 
     console.log(chalk.blue(`Creating SOCKS5 proxy tunnel...`));
     console.log(chalk.green(`SOCKS5 proxy will be available at:`));
@@ -465,18 +774,18 @@ program
     }
 
     // Get sing-box password
-    const { singPassword } = await inquirer.prompt([
-      {
-        type: "password",
-        name: "singPassword",
-        message: "Enter sing-box password for shadowsocks:",
-      },
-    ]);
+    let singPassword = server.singPassword;
+
+    if (!singPassword) {
+      console.log(chalk.red("No sing-box password found for this server."));
+      console.log(chalk.blue("Please set it first using: assh update"));
+      process.exit(1);
+    }
 
     // Create temporary config file
     const tempConfigPath = path.join(
-      CONFIG_DIR,
-      `${serverName}_sing_temp.json`
+      os.tmpdir(),
+      `assh_${serverName}_sing_${Date.now()}.json`
     );
     const singConfig = {
       experimental: {
@@ -590,6 +899,9 @@ program
     try {
       await fs.writeJson(tempConfigPath, singConfig, { spaces: 2 });
 
+      // Track temp file for cleanup
+      tempFiles.add(tempConfigPath);
+
       console.log(chalk.blue("Starting sing-box..."));
       console.log(
         chalk.yellow("Note: This requires sudo privileges for TUN interface.")
@@ -601,23 +913,22 @@ program
         { stdio: "inherit" }
       );
 
-      // Cleanup temp file on exit
-      process.on("exit", () => {
+      singProcess.on("error", (error) => {
+        console.error(chalk.red("Sing-box error:"), error.message);
+        // Cleanup temp file on error
+        tempFiles.delete(tempConfigPath);
         try {
           fs.removeSync(tempConfigPath);
         } catch (e) {
           // Ignore cleanup errors
         }
-      });
-
-      singProcess.on("error", (error) => {
-        console.error(chalk.red("Sing-box error:"), error.message);
         process.exit(1);
       });
 
       singProcess.on("close", (code) => {
         console.log(chalk.blue(`Sing-box closed with code ${code}`));
-        // Cleanup temp file
+        // Cleanup temp file on close
+        tempFiles.delete(tempConfigPath);
         try {
           fs.removeSync(tempConfigPath);
         } catch (e) {
@@ -651,14 +962,43 @@ program
     }
 
     // Get xray UUID
-    const { xrayId } = await inquirer.prompt([
-      {
-        type: "input",
-        name: "xrayId",
-        message: "Enter Xray UUID:",
-        validate: (input) => (input.trim() ? true : "Xray UUID is required"),
-      },
-    ]);
+    let xrayId = server.xrayId;
+
+    if (!xrayId) {
+      console.log(chalk.red("No Xray UUID found for this server."));
+      console.log(chalk.blue("Please set it first using: assh update"));
+      process.exit(1);
+    }
+
+    // Get port preferences
+    let socksPort, httpPort;
+
+    if (server.proxyPort) {
+      socksPort = server.proxyPort;
+      httpPort = server.proxyPort + 1;
+    } else {
+      const { mixedPort } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "mixedPort",
+          message: "Enter base port for SOCKS5 and HTTP proxy:",
+          default: "8090",
+          validate: (input) => {
+            const port = parseInt(input);
+            return port > 0 && port <= 65533
+              ? true
+              : "Port must be between 1 and 65533";
+          },
+        },
+      ]);
+
+      socksPort = parseInt(mixedPort);
+      httpPort = socksPort + 1;
+
+      // Store port preferences
+      server.proxyPort = socksPort;
+      await saveConfig();
+    }
 
     const xrayConfig = {
       log: {
@@ -686,7 +1026,7 @@ program
       ],
       inbounds: [
         {
-          port: 8090,
+          port: socksPort,
           protocol: "socks",
           settings: {
             auth: "noauth",
@@ -694,7 +1034,7 @@ program
           },
         },
         {
-          port: 8091,
+          port: httpPort,
           protocol: "http",
         },
       ],
@@ -703,10 +1043,12 @@ program
     try {
       console.log(chalk.blue("Starting Xray..."));
       console.log(
-        chalk.green("SOCKS5 proxy available at: socks5://127.0.0.1:8090")
+        chalk.green(
+          `SOCKS5 proxy available at: socks5://127.0.0.1:${socksPort}`
+        )
       );
       console.log(
-        chalk.green("HTTP proxy available at: http://127.0.0.1:8091")
+        chalk.green(`HTTP proxy available at: http://127.0.0.1:${httpPort}`)
       );
 
       const xrayProcess = spawn("xray", ["run"], {
